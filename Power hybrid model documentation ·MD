@@ -1,0 +1,358 @@
+# Power-Hybrid Battery Health & Fault Diagnosis Pipeline — Technical Documentation
+
+Companion document to `power_hybrid_battery_diagnosis.ipynb`. This file explains the problem, the data,
+the model, why it was chosen, how it's trained/calibrated, what it outputs, and how to run it in production.
+
+---
+
+## 1. Problem & Objective
+
+**What it solves:** a hybrid power system (battery pack + distribution bus) needs to know, continuously and
+automatically, whether it is **healthy (H)** or **unhealthy (UH)** — and ideally *which* fault it has —
+using only onboard voltage/current/temperature telemetry, without waiting for a full failure.
+
+**Why it matters:**
+- **Safety** — thermal runaway precursors need to be caught in seconds, not after the fact.
+- **Availability** — bus-level electrical faults (overcurrent, undervoltage) can cascade into load-shedding
+  or subsystem loss if not flagged immediately.
+- **Longevity/planning** — gradual battery degradation (capacity fade) needs to be tracked over time so a
+  cell/pack can be scheduled for replacement or de-rated before it becomes a hard failure.
+- **Constraint** — the detector must run onboard, in real time, on limited compute (no offline batch
+  processing for the primary layer), which rules out heavy ML models as the *primary* method and points to
+  a lightweight, causal, physics-based estimator instead.
+
+**Objective:** classify each telemetry stream as `H` / `UH`, and (for battery faults) give a real-time state
+estimate (SOC) and a physically interpretable degradation signal, while keeping compute low enough for
+onboard/flight use.
+
+---
+
+## 2. Dataset
+
+**Source:** `power_hybrid_preview.zip` (synthetic/simulated preview dataset representing a hybrid power
+system — single-cell battery telemetry + downstream bus/distribution telemetry).
+
+**Structure:**
+```
+preview/
+├── manifest.csv            # ground truth per test instance
+├── cell/                   # cell-level (single battery cell) telemetry, 1 Hz
+│   ├── normal_000.csv, normal_001.csv
+│   ├── gradual_capacity_fade_000.csv, _001.csv
+│   ├── accelerated_fade_000.csv, _001.csv
+│   ├── thermal_runaway_precursor_000.csv, _001.csv
+│   ├── bus_voltage_fault_000.csv, _001.csv          # flat placeholder (see note below)
+│   └── distribution_overcurrent_000.csv, _001.csv   # flat placeholder (see note below)
+└── bus/                    # bus/distribution-level telemetry, 100 Hz
+    └── (same 12 instance names)
+```
+
+**Size:** 12 test instances total (6 fault types × 2 repeats). Cell files: 1,800 rows each (30 min @ 1 Hz).
+Bus files: 180,000 rows each (30 min @ 100 Hz). ~2.18M rows overall.
+
+**Labels (`manifest.csv`):**
+| Column | Meaning |
+|---|---|
+| `instance_id` | unique test run name |
+| `fault_type` | `normal`, `gradual_capacity_fade`, `accelerated_fade`, `thermal_runaway_precursor`, `bus_voltage_fault`, `distribution_overcurrent` |
+| `label` | `H` (healthy) or `UH` (unhealthy) — the ground-truth target |
+| `real_battery_data_used` | `True` if the cell CSV is a physics-simulated battery discharge; `False` if it's a flat placeholder (used for the two distribution-layer faults, where the fault isn't a battery phenomenon) |
+| `soh_pct` | ground-truth State-of-Health percentage for that cell (100% = new; ~82% = faded) |
+
+**Preprocessing done in the pipeline:**
+- Coulomb counting: `Q(t) = -∫I dt` (Ah) from cell current, to derive an SOC(%) trace for the reference
+  (healthy) cell.
+- Smoothing: Savitzky–Golay filter (window 51, order 3) to build a clean reference voltage-vs-SOC curve
+  from noisy raw data, and (window 21, order 3) to smooth the interpolated dQ/dV curve.
+- Resampling: dQ/dV is computed on a uniform 300-point voltage grid (via linear interpolation) rather than
+  raw irregular timestamps, so the derivative is well-behaved.
+- Robust statistics for the bus layer: 1st/99th percentiles instead of raw min/max, since raw min/max over
+  180,000 samples is a noisy extreme-value statistic even for healthy data.
+
+**Known dataset limitation (documented, not hidden):** all cell discharges are a single, roughly constant
+~1C-rate discharge. There is no HPPC pulse/relaxation test and no low-rate (≈C/20) sweep, both of which are
+normally required to cleanly separate ohmic resistance from open-circuit voltage, and to get artifact-free
+dQ/dV peaks. The pipeline works around this transparently (see §5, §9) rather than pretending the data is
+richer than it is.
+
+---
+
+## 3. Inputs
+
+| Signal | Source file | Unit | Typical range in this dataset | Meaning |
+|---|---|---|---|---|
+| `t_s` | cell & bus | seconds | 0 – 1799 (cell), 0 – 1799.99 (bus) | elapsed test time |
+| `cell_voltage_v` | cell | Volts | ~2.4 – 4.2 V | single-cell terminal voltage |
+| `cell_current_a` | cell | Amps | ~ -2.0 – 0 A (negative = discharge) | single-cell current |
+| `cell_temp_c` | cell | °C | ~22 – 76 °C (76 °C only under thermal runaway) | cell surface/core temperature |
+| `bus_voltage_v` | bus | Volts | ~24 – 28.4 V | distribution bus voltage |
+| `branch_1/2/3_current_a` | bus | Amps | ~1.2 – 7.1 A | current on each of 3 downstream branches |
+| `fault_type`, `label`, `real_battery_data_used`, `soh_pct` | manifest | categorical / % | — | ground truth, used only for calibration/evaluation, never fed into the estimator itself |
+
+**Derived/engineered inputs used internally by the model:**
+- `SOC(t)` (%) — from coulomb counting, `Qmax_healthy` = total Ah delivered by the healthy reference cell.
+- `V_ref(SOC)` — empirical reference voltage-vs-SOC curve built once from the healthy discharge.
+- Per-instance features for the rule layer: `resid_std`, `resid_max`, `tail_resid_mean/std` (last 25% of
+  the discharge), `max_temp`, `max_dT/dt`, dQ/dV `peak_V` shift, bus `voltage_zscore`, `current_zscore`.
+
+---
+
+## 4. Model Architecture
+
+Three parallel, purpose-fit components, fused into one verdict per test instance:
+
+```mermaid
+flowchart TD
+    A[Raw telemetry CSVs<br/>cell: V, I, T @1Hz &nbsp; bus: V, I×3 @100Hz] --> B{real_battery_data_used?}
+
+    B -- True --> C[Cell-level pipeline]
+    B -- False --> H[Bus-level pipeline]
+
+    subgraph C[Cell-level: battery health]
+        direction TB
+        C1[Coulomb counting<br/>SOC via ∫I dt] --> C2[Reference curve V_ref(SOC)<br/>built once from healthy cell]
+        C2 --> C3[1RC Equivalent-Circuit Model<br/>V = V_ref(SOC) − I·R0 − V_RC]
+        C3 --> C4[Extended Kalman Filter<br/>state = SOC, V_RC]
+        C4 --> C5[Residual / innovation<br/>y = V_meas − V_pred]
+        C5 --> C6[Threshold rule<br/>resid_max, max dT/dt]
+        C1 --> C7[Differential Capacity Analysis<br/>dQ/dV vs V, Savitzky-Golay smoothed]
+        C7 --> C8[Peak-voltage shift vs healthy]
+        C6 --> F[Cell verdict]
+        C8 --> F
+    end
+
+    subgraph H[Bus-level: distribution health]
+        direction TB
+        H1[Healthy-run baseline<br/>mean, std of V_bus & branch I] --> H2[Percentile features<br/>1st pct V, 99th pct I]
+        H2 --> H3[Z-score threshold rule<br/>undervoltage / overcurrent]
+    end
+
+    F --> Z[Fused system-health verdict<br/>H / UH per instance]
+    H3 --> Z
+    Z --> R[Comparison vs manifest ground truth<br/>+ accuracy report]
+```
+
+### 4.1 Cell-level: Equivalent-Circuit Model (ECM)
+
+1st-order Thevenin/RC model:
+
+```
+V(t) = V_ref(SOC(t)) − (I(t) − I_ref)·R0 − V_RC(t)
+dV_RC/dt = −V_RC / (R1·C1) + I(t) / C1
+```
+
+- `V_ref(SOC)`: empirical curve built by mapping the healthy reference discharge onto SOC (via coulomb
+  counting) and smoothing with Savitzky–Golay. Acts as the OCV-analog in this reduced model.
+- `R0` (ohmic resistance), `R1`, `C1` (single RC branch: polarization resistance/capacitance) — fixed to
+  representative small-format Li-ion literature values (see §6) because this dataset can't identify them
+  independently (see §2 limitation).
+
+### 4.2 Cell-level: Extended Kalman Filter (EKF)
+
+- **State vector:** `x = [SOC (%), V_RC (V)]`
+- **Process model:** SOC updated by coulomb counting (`ΔSOC = -100·I·Δt / (3600·Qmax)`); `V_RC` updated by
+  the RC discharge/charge equation above.
+- **Measurement model:** `h(x) = V_ref(SOC) − (I − I_ref)·R0 − V_RC`, linearized each step via a numeric
+  Jacobian of `V_ref` w.r.t. SOC (central difference, `ε = 1e-3`).
+- **Output per sample:** updated state estimate `[SOC, V_RC]` and the innovation/residual
+  `y = V_measured − h(x_predicted)` — this residual is the primary real-time anomaly signal.
+
+### 4.3 Cell-level: Differential Capacity Analysis (dQ/dV, ICA)
+
+- Compute cumulative capacity `Q(t)` (mAh) via coulomb counting.
+- Resample `Q` onto a uniform voltage grid (300 points), smooth with Savitzky–Golay, then
+  `dQ/dV = np.gradient(Q_smooth, V_grid)`.
+- Compare the voltage location of the peak `dQ/dV` against the healthy reference — a shift indicates
+  electrode/impedance changes associated with degradation.
+
+### 4.4 Bus-level: rule-based statistical detector
+
+- Baseline `mean, std` of bus voltage and each branch current computed from the healthy runs only.
+- Per-instance features: 1st-percentile bus voltage (z-scored) and max of the 99th-percentile branch
+  currents (z-scored) — percentiles chosen over raw min/max because raw extreme values are noisy over
+  180,000-sample runs.
+- Simple threshold rule flags `UH (undervoltage)` / `UH (overcurrent)` / `H`.
+
+### 4.5 Fusion layer
+
+- Cell-origin instances: `UH` if **either** the EKF residual rule fires **or** the dQ/dV peak shift exceeds
+  its threshold (OR-fusion — either signal is sufficient to flag).
+- Bus-origin instances: `UH` if the bus rule fires.
+- Final per-instance verdict is compared against `manifest.label` to compute accuracy.
+
+---
+
+## 5. Why This Model (vs. Alternatives)
+
+| Option | Verdict | Reasoning |
+|---|---|---|
+| **ECM + EKF** (chosen, primary) | ✅ | Causal (no future data needed), low compute, runs sample-by-sample — the standard architecture behind flight/EV battery management systems. Gives a state estimate *and* an anomaly signal from the same pass. Well-understood tuning/convergence behavior, important for flight heritage. |
+| Black-box ML classifier (e.g., LSTM/RandomForest on raw signals) as the *primary* onboard detector | ❌ (not primary) | Needs a training set; with only 2 instances per class this dataset can't support a generalizable model, and even with more data, a black-box model is harder to certify/validate for a safety-critical onboard role and doesn't give an interpretable physical state (SOC) the rest of the system needs anyway. |
+| dQ/dV (ICA) as the *only* method | ❌ (used as secondary only) | Very sensitive to *shape* changes (great for subtle capacity fade — see §7), but needs a full, reasonably clean, ideally slow (≈C/20) charge/discharge sweep to compute — not compatible with real-time, arbitrary-duty-cycle onboard operation. |
+| Simple fixed thresholds on raw V/I/T (no model) | ❌ (used only where appropriate: bus layer) | Fine for the bus layer, where faults are direct electrical excursions. Not adequate for battery-cell faults, where degradation shows up as a *pattern relative to SOC/current*, not a fixed absolute limit — an ECM/EKF is needed to separate "expected voltage sag" from "abnormal voltage sag." |
+
+**Net design:** use the right tool per layer — ECM+EKF for cell electrochemistry (primary, onboard),
+dQ/dV for the specific failure mode (subtle capacity fade) the primary method is weakest at (secondary,
+ground diagnostic), and simple statistical rules for the bus layer, where a battery model would be the
+wrong abstraction entirely (confirmed empirically by the dataset's own `real_battery_data_used=False` flag).
+
+---
+
+## 6. Training Process
+
+This pipeline is **not a trained ML model** in the gradient-descent sense — it's a physics-based estimator
+(EKF) plus signal-processing diagnostics (dQ/dV) plus calibrated statistical thresholds. "Training" here
+means **parameter identification and threshold calibration**, done once from the healthy reference data:
+
+| Component | "Training" step | Value used | Calibration data |
+|---|---|---|---|
+| `Qmax_healthy` | total Ah delivered by healthy cell | ≈ 0.913 Ah | `cell/normal_000.csv` |
+| `V_ref(SOC)` | Savitzky–Golay smoothing (window=51, polyorder=3) of healthy V vs. coulomb-counted SOC | curve (300+ pts) | `cell/normal_000.csv` |
+| `R0` | fixed (literature-typical, not identifiable from this dataset — see §2) | 0.05 Ω | — |
+| `R1, C1` | fixed (literature-typical) | 0.01 Ω, 2000 F → τ = 20 s | — |
+| EKF process noise `Q` | manually tuned diagonal covariance | `diag([5e-3, 1e-8])` | tuned for stable convergence on healthy data |
+| EKF measurement noise `R` | manually tuned scalar | `8e-4` (V²) | tuned for stable convergence on healthy data |
+| Initial state covariance `P0` | manually set | `diag([9.0, 1e-4])` | — |
+| Residual threshold (`resid_max`) | 1.5 × max over healthy instances | ≈ 2.48 V | `normal_000`, `normal_001` |
+| Temperature-rate threshold (`max dT/dt`) | 1.5 × max over healthy instances | ≈ 0.0385 °C/s | `normal_000`, `normal_001` |
+| ICA peak-shift threshold | fixed engineering margin | 0.05 V | set relative to healthy peak location |
+| Bus voltage z-score threshold | fixed engineering margin above observed healthy z-scores | −10.0 | `bus/normal_000`, `bus/normal_001` |
+| Bus current z-score threshold | fixed engineering margin above observed healthy z-scores | 3.0 | `bus/normal_000`, `bus/normal_001` |
+
+**No loss function, optimizer, epochs, or batch size** apply here — there is no neural network. The EKF's
+internal "loss" is implicitly the weighted innovation `y² / S` it minimizes recursively at every timestep
+(standard Kalman filter optimality under the assumed noise model), and the only offline optimization used
+anywhere is a Savitzky–Golay smoothing pass (a fixed-window polynomial fit, not an iterative training loop).
+
+**Caveat:** every threshold above is calibrated from only **2 healthy instances** — appropriate only as a
+placeholder for this preview dataset. In production, calibrate as `mean + kσ` (e.g., k=3) over a much larger
+healthy-fleet history.
+
+---
+
+## 7. Output / Results
+
+Running the notebook against the preview dataset gives, per instance:
+
+| Instance | Fault | True label | EKF residual flag | dQ/dV peak shift (V) | Final verdict | Correct? |
+|---|---|---|---|---|---|---|
+| normal_000/001 | normal | H | H | 0.000 | H | ✓ |
+| gradual_capacity_fade_000/001 | gradual_capacity_fade | UH | H | 0.255 | UH | ✓ |
+| accelerated_fade_000/001 | accelerated_fade | UH | H | 0.152 | UH | ✓ |
+| thermal_runaway_precursor_000/001 | thermal_runaway_precursor | UH | UH | 0.081 | UH | ✓ |
+| bus_voltage_fault_000/001 | bus_voltage_fault | UH | n/a | — | UH | ✓ |
+| distribution_overcurrent_000/001 | distribution_overcurrent | UH | n/a | — | UH | ✓ |
+
+**Overall accuracy on this 12-instance preview set: 12/12 = 100%** (after calibrating the bus detector on
+robust percentile features — the initial raw-min/max version scored 11/12, missing one overcurrent case;
+see §9).
+
+**Key findings:**
+- The **EKF voltage residual alone** correctly separates `normal` from `thermal_runaway_precursor`
+  (residual std ≈ 0.03 V vs ≈0.014 V for healthy; max residual and `max dT/dt` both clear the healthy-based
+  threshold), but **does not** reliably separate `normal` from `gradual_capacity_fade` on a single ~1C
+  discharge — the voltage-trajectory effect of subtle fade is smaller than the noise floor of a single-shot
+  residual.
+- **dQ/dV peak-voltage shift** clearly separates all three degraded-battery cases from `normal`
+  (0.15–0.26 V shift vs. 0 V for the healthy baseline itself), including the case (`gradual_capacity_fade`)
+  where the EKF residual was weakest — confirming it as the right complementary check.
+- **Bus-level z-score rules** cleanly separate `bus_voltage_fault` (voltage z-score ≈ −42 to −44, vs. ≈ −3
+  for healthy) and, once computed on robust percentile features, `distribution_overcurrent` (current
+  z-score ≈ 3.9–14.5, vs. ≈ 1.8–2.4 for healthy).
+
+---
+
+## 8. Inference / Working Flow (step by step)
+
+**A. Cell-origin instance (`real_battery_data_used = True`):**
+1. Load `cell/{instance_id}.csv` → arrays of `t, V, I, T`.
+2. Compute `Δt` per sample.
+3. **EKF loop**, once per sample `k`:
+   a. *Predict* `SOC_k` via coulomb counting using `I_k`, `Δt_k`, `Qmax_healthy`.
+   b. *Predict* `V_RC,k` via the RC discharge equation.
+   c. Propagate covariance `P` with the linearized state-transition Jacobian `F`.
+   d. *Update*: compute predicted voltage `V̂ = V_ref(SOC) − (I−I_ref)·R0 − V_RC`, innovation
+      `y = V_measured − V̂`, Kalman gain `K`, and correct `[SOC, V_RC]` and `P`.
+   e. Store `y` (residual) and `SOC` for this sample.
+4. After the full run: extract residual/temperature summary features (`resid_max`, `max dT/dt`, tail
+   residual stats).
+5. Apply the healthy-calibrated threshold rule → `pred_ekf ∈ {H, UH}`.
+6. Separately, compute `dQ/dV` for the same instance and compare its peak-voltage location to the healthy
+   reference peak → `ica_peak_shift`.
+7. **Fuse**: `final_verdict = UH if (pred_ekf == UH) or (ica_peak_shift > 0.05 V) else H`.
+
+**B. Bus-origin instance (`real_battery_data_used = False`):**
+1. Load `bus/{instance_id}.csv` → `V_bus`, 3× branch currents.
+2. Compute 1st-percentile bus voltage and 99th-percentile of each branch current.
+3. Z-score each against the healthy-run baseline (`mean, std` from `normal_000/001`).
+4. Apply threshold rule → `pred_bus ∈ {H, UH (undervoltage), UH (overcurrent)}`.
+
+**C. System-level report:** combine A and B outputs into one table alongside `manifest.label`, mark
+correct/incorrect, and print overall accuracy.
+
+---
+
+## 9. Implementation
+
+**Language/runtime:** Python 3, designed for Google Colab (no GPU needed — everything here is O(n) per
+timestep, runs in well under a second per instance on CPU).
+
+**Key libraries:**
+- `numpy` — array math, EKF linear algebra.
+- `pandas` — CSV loading, manifest handling, feature tables.
+- `scipy.signal.savgol_filter` — reference-curve and dQ/dV smoothing.
+- `matplotlib` — all plots (voltage/current/temperature traces, residuals, dQ/dV overlay).
+- `google.colab.files` (Colab-only) — zip upload handling.
+
+**Hardware/software requirements:** any machine that can run Python + numpy/scipy/pandas/matplotlib;
+no GPU, no deep learning framework. Runs comfortably in the free Colab tier.
+
+**Key code components (all in `power_hybrid_battery_diagnosis.ipynb`):**
+- `run_ekf(instance_id, Qmax_ref)` — the EKF loop described in §4.2/§8A.
+- `Vref_of_soc(soc)` — interpolation lookup for the empirical reference curve.
+- `differential_capacity(instance_id, n_grid=300)` — the dQ/dV computation described in §4.3.
+- Bus feature/threshold block — the rule-based detector described in §4.4.
+- Final fusion + accuracy block — described in §4.5 / §7.
+
+**Notable implementation fix applied during validation:** the first version of the bus detector used raw
+`min()`/`max()` over the 180,000-sample bus files as its z-score input; because raw extremes are noisy even
+for healthy data, this misclassified one `distribution_overcurrent` instance. Switching to 1st/99th
+percentile features (a more robust "sustained excursion" statistic) fixed this and brought accuracy to
+12/12 — documented here as an example of why every stage was executed end-to-end and checked against ground
+truth rather than assumed correct from the design alone.
+
+---
+
+## 10. Limitations & Future Improvements
+
+**Current limitations:**
+1. **`R0`/`R1`/`C1` are not identified from this data** — they're literature-typical placeholders, because
+   the dataset only contains constant-current discharges (no HPPC pulse-relaxation test), which makes `R0`
+   and the OCV curve mathematically non-separable from a constant-current run.
+2. **`V_ref(SOC)` is an empirical loaded-voltage curve, not a true open-circuit voltage curve** — a real
+   OCV curve requires a low-rate (≈C/20) quasi-equilibrium sweep; this dataset's ~1C discharge doesn't
+   provide one.
+3. **Thresholds are calibrated from only 2 healthy instances per layer** — statistically weak; fine as a
+   preview/demo but not production-grade.
+4. **EKF residual is weak on subtle, slow capacity fade** on a single discharge — mitigated by dQ/dV here,
+   but a production system should also track EKF-derived SOH/capacity trend across *many* cycles, not just
+   one.
+5. **dQ/dV computed on a ~1C discharge rather than a slow sweep** — peaks are usable for relative
+   comparison here but are broadened/shifted by IR drop compared to a true low-rate ICA sweep.
+6. **Very small sample size overall (12 instances, 2 per class)** — no statistically robust model
+   validation (e.g., train/test split, cross-validation) is meaningful yet; results in §7 should be read as
+   a proof-of-concept on this preview, not a generalization guarantee.
+
+**Future improvements:**
+- Run an HPPC pulse-relaxation test and a C/20 OCV sweep on the actual flight cell to properly identify
+  `R0, R1, C1` and replace `V_ref(SOC)` with a true OCV(SOC) curve.
+- Recalibrate all thresholds statistically (e.g., mean + 3σ) once a larger healthy-fleet dataset is
+  available; consider adaptive/online threshold updates as the fleet ages.
+- Track dQ/dV peak shift and EKF-derived capacity **run-over-run** (a time series across many cycles) rather
+  than single-shot, which is both more sensitive and more robust to per-cycle noise.
+- Extend the EKF to a 2RC (or higher-order) ECM if flight duty cycles include fast transients/pulses that a
+  single RC branch can't capture well.
+- Add a proper multi-class fault-type classifier (not just H/UH) once enough labeled instances per class
+  exist to train and validate one without overfitting.
+- Add explicit uncertainty bounds (e.g., report the EKF's own state covariance `P`) alongside the H/UH
+  verdict, so downstream systems can weight the confidence of a flag, not just its binary value.
